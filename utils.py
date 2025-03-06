@@ -11,7 +11,16 @@ from nltk.tag import pos_tag
 from typing import Dict, List, Set, Tuple, Any, Union
 
 _LOG_FILE = None
-
+file_mapping = {
+        "Trees.csv": "trees",
+        "Plants.csv": "plants",
+        "Mammals.csv": "mammals",
+        "Birds.csv": "birds",
+        "Reptiles.csv": "reptiles",
+        "Marine.csv": "marine",
+        "Small_Creatures.csv": "small_creatures",
+        "Mollusc.csv": "mollusc"
+    }
 
 def ensure_directory(directory_path):
     """ Ensure it exists."""
@@ -70,17 +79,6 @@ def load_data(flora_fauna_path: str):
     original_to_lower = {}
     multi_word_terms = set()
     species_flags = {}
-
-    file_mapping = {
-        "Trees.csv": "trees",
-        "Plants.csv": "plants",
-        "Mammals.csv": "mammals",
-        "Birds.csv": "birds",
-        "Reptiles.csv": "reptiles",
-        "Marine.csv": "marine",
-        "Small_Creatures.csv": "small_creatures",
-        "Mollusc.csv": "mollusc"
-    }
 
     for file, category in file_mapping.items():
         file_path = Path(flora_fauna_path) / file
@@ -158,6 +156,40 @@ def extract_mention_context(sentences, curr_idx, sentence, start, end, matched_t
     }
 
 
+def process_mention(start, end, match_text, species_name, sentence_mapping, indexed_sentences, analysis_mentions, annotation_mentions, output_format):
+    """
+    Processes each flora/fauna mentioned in the text and maps it back to the singular or annotates if
+    for label-studio.
+    """
+    sent_start_candidates = [pos for pos in sentence_mapping.keys() if pos <= start]
+    if sent_start_candidates:
+        sent_start = max(sent_start_candidates)
+        sent_info = sentence_mapping[sent_start]
+
+        curr_idx = next((i for i, (_, sentence) in enumerate(indexed_sentences) if sentence == sent_info['text']), -1)
+        if curr_idx != -1:
+            mention = {
+                "from_name": "label",
+                "to_name": "text",
+                "type": "labels",
+                "value": {
+                    "start": start,
+                    "end": end,
+                    "text": match_text,
+                    "sentence": sent_info['text'],
+                    "labels": [species_name]
+                }
+            }
+
+            if output_format == "analysis":
+                analysis_mentions[species_name].append(mention)
+            elif output_format == "annotation":
+                annotation_mentions.append(mention)
+
+            return True
+    return False
+
+
 def get_species_mentions(
         text: str,
         sentences: List[str],
@@ -167,8 +199,9 @@ def get_species_mentions(
         output_format: str = "analysis"
 ) -> Union[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """
-    A wild program hunting for plants and animals in the great wilderness of text.
+    Finds/identifies flora/fauna
     """
+    lemmatizer = WordNetLemmatizer()
     text_lower = text.lower()
     found_positions = set()
 
@@ -192,67 +225,12 @@ def get_species_mentions(
             }
             current_pos = sent_end
 
-    def process_mention(start, end, match_text, species_name):
-        sent_start_candidates = [pos for pos in sentence_mapping.keys() if pos <= start]
-        if sent_start_candidates:
-            sent_start = max(sent_start_candidates)
-            sent_info = sentence_mapping[sent_start]
-
-            curr_idx = next((i for i, (_, sentence) in enumerate(indexed_sentences) if sentence == sent_info['text']), -1)
-
-            if curr_idx != -1:
-                is_multi_word = " " in match_text.lower()
-                special_case = species_name.lower() in ["raven", "tree"]
-
-                word_pos = None
-                if not (is_multi_word or special_case):
-                    first_word = match_text.split()[0]
-                    word_pos = next((pos_ for w, pos_ in sent_info['pos_tags'] if w.lower() == first_word.lower()), None)
-
-                    if word_pos:
-                        if species_name.lower() == "marten" and word_pos in ("NNP", "NNPS"):
-                            return False
-                        if species_name.lower() in ["swift", "sage", "coral"] and word_pos.startswith("JJ"):
-                            return False
-                        if not (word_pos.startswith("NN") or word_pos.startswith("JJ")):
-                            return False
-
-                if output_format == "analysis":
-                    mention_data = extract_mention_context(
-                        indexed_sentences, curr_idx, sent_info['text'],
-                        start - sent_start, (start - sent_start) + len(match_text),
-                        match_text, species_name
-                    )
-                    analysis_mentions[species_name].append(mention_data)
-
-                elif output_format == "annotation":
-                    pos_value = "COMPOUND" if is_multi_word else (
-                        "nn" if special_case else word_pos
-                    )
-
-                    annotation_mentions.append({
-                        "from_name": "label",
-                        "to_name": "text",
-                        "type": "labels",
-                        "value": {
-                            "start": start,
-                            "end": end,
-                            "text": match_text,
-                            "sentence": sent_info['text'],
-                            "pos": pos_value,
-                            "labels": [species_name]
-                        }
-                    })
-
-                return True
-        return False
-
     for term in multi_word_terms:
         for match in re.finditer(rf"\b{re.escape(term)}\b", text_lower):
             start, end = match.span()
             if not any(s <= start < e or s < end <= e for s, e in found_positions):
-                species_original = original_to_lower.get(match_text, match_text)
-                if process_mention(start, end, text[start:end], species_original):
+                species_original = original_to_lower.get(match.group(1), match.group(1))
+                if process_mention(start, end, text[start:end], species_original, sentence_mapping, indexed_sentences, analysis_mentions, annotation_mentions, output_format):
                     found_positions.add((start, end))
 
     offset_in_text = 0
@@ -268,10 +246,11 @@ def get_species_mentions(
             end = found_idx + len(tok)
             offset_in_text = end
 
-            original_name = original_to_lower.get(tok_lower)
+            lemma = lemmatizer.lemmatize(tok_lower, pos='n')
+            species_name = original_to_lower.get(lemma)
 
-            if original_name and not any((s <= start < e_ or s < end <= e_) for s, e_ in found_positions):
-                if process_mention(start, end, text[start:end], original_name):
+            if species_name and not any((s <= start < e_ or s < end <= e_) for s, e_ in found_positions):
+                if process_mention(start, end, text[start:end], species_name, sentence_mapping, indexed_sentences, analysis_mentions, annotation_mentions, output_format):
                     found_positions.add((start, end))
 
     return analysis_mentions if output_format == "analysis" else annotation_mentions
