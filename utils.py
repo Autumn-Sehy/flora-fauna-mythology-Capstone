@@ -6,9 +6,9 @@ from datetime import datetime
 from collections import defaultdict
 import pandas as pd
 from nltk.stem import WordNetLemmatizer
-from nltk.tokenize import word_tokenize, sent_tokenize
+from nltk.tokenize import word_tokenize
 from nltk.tag import pos_tag
-from typing import Dict, List, Set, Tuple, Any, Optional, Union
+from typing import Dict, List, Set, Tuple, Any, Union
 
 _LOG_FILE = None
 
@@ -61,15 +61,13 @@ def close_log_file():
 
 def load_data(flora_fauna_path: str):
     """Loads up all the flora and fauna from the CSVs."""
-    lemmatizer = WordNetLemmatizer()
 
     data = {key: {} for key in [
         "trees", "plants", "mammals", "birds",
         "reptiles", "marine", "small_creatures", "mollusc"
     ]}
 
-    lemma_to_original = {}
-    original_to_lemma = {}
+    original_to_lower = {}
     multi_word_terms = set()
     species_flags = {}
 
@@ -86,61 +84,44 @@ def load_data(flora_fauna_path: str):
 
     for file, category in file_mapping.items():
         file_path = Path(flora_fauna_path) / file
-        if not file_path.exists():
-            continue
+        if file_path.exists():
+            df = pd.read_csv(file_path).dropna(axis=1, how="all")
 
-        df = pd.read_csv(file_path).dropna(axis=1, how="all")
-        if df.empty:
-            continue
+            if not df.empty:
+                predator_col, prey_col = None, None
+                for col_idx, col_name in enumerate(df.columns):
+                    col_name_clean = col_name.lower().strip()
+                    if re.search(r"predator", col_name_clean, re.IGNORECASE):
+                        predator_col = col_idx
+                    if re.search(r"prey", col_name_clean, re.IGNORECASE):
+                        prey_col = col_idx
 
-        predator_col, prey_col = None, None
-        for col_idx, col_name in enumerate(df.columns):
-            col_name_clean = col_name.lower().strip()
-            if re.search(r"predator", col_name_clean, re.IGNORECASE):
-                predator_col = col_idx
-            if re.search(r"prey", col_name_clean, re.IGNORECASE):
-                prey_col = col_idx
+                for _, row in df.iterrows():
+                    name = str(row.iloc[0]).strip()
 
-        for _, row in df.iterrows():
-            name = str(row.iloc[0]).strip()
+                    #if name and name.lower() not in {"yes", "drill", "nan", "none", "as"}:
+                    #this is from an earlier version of the code where I was using lemmatization
+                    #I have it on here in case I want to bring that back
+                    original_lower = name.lower()
 
-            if not name or name.lower() in {"yes", "drill", "nan", "none", "as"}:
-                continue
+                    if " " in original_lower:
+                        multi_word_terms.add(original_lower)
 
-            original_lower = name.lower()
-            #this is for donkeys, ok? IDK why but the system always
-            #refuses to tag them and they use 'ass' everywhere in the egyptian texts
-            if original_lower == "ass":
-                continue
-            elif original_lower in {"yew", "yews"}:
-                lemma_name = "yew"
-            elif original_lower in {"mandrill", "mandrills"}:
-                lemma_name = "mandrill"
-            else:
-                if " " in original_lower:
-                    multi_word_terms.add(original_lower)
-                    lemma_name = original_lower
-                else:
-                    lemma_name = lemmatizer.lemmatize(original_lower, pos='n')
-                    if lemma_name == "as":
-                        continue
+                    data[category][original_lower] = name
+                    original_to_lower[name] = original_lower
 
-            data[category][lemma_name] = name
-            lemma_to_original[lemma_name] = name
-            original_to_lemma[name] = lemma_name
+                    if original_lower not in species_flags:
+                        species_flags[original_lower] = {}
 
-            if lemma_name not in species_flags:
-                species_flags[lemma_name] = {}
+                    if predator_col is not None:
+                        predator_value = str(row.iloc[predator_col]).strip().lower()
+                        species_flags[original_lower]["predator"] = predator_value in ["yes", "y", "true", "1"]
 
-            if predator_col is not None and len(row) > predator_col:
-                predator_value = str(row.iloc[predator_col]).strip().lower()
-                species_flags[lemma_name]["predator"] = predator_value in ["yes", "y", "true", "1"]
+                    if prey_col is not None:
+                        prey_value = str(row.iloc[prey_col]).strip().lower()
+                        species_flags[original_lower]["prey"] = prey_value in ["yes", "y", "true", "1"]
 
-            if prey_col is not None and len(row) > prey_col:
-                prey_value = str(row.iloc[prey_col]).strip().lower()
-                species_flags[lemma_name]["prey"] = prey_value in ["yes", "y", "true", "1"]
-
-    return data, lemma_to_original, original_to_lemma, multi_word_terms, species_flags
+    return data, original_to_lower, multi_word_terms, species_flags
 
 
 def should_annotate(species_name: str, word_pos: str) -> bool:
@@ -181,16 +162,13 @@ def get_species_mentions(
         text: str,
         sentences: List[str],
         indexed_sentences: List[Tuple[int, str]],
-        lemma_to_original: Dict[str, str],
-        original_to_lemma: Dict[str, str],
+        original_to_lower: Dict[str, str],
         multi_word_terms: Set[str],
-        lemmatizer: WordNetLemmatizer,
         output_format: str = "analysis"
 ) -> Union[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """
     A wild program hunting for plants and animals in the great wilderness of text.
     """
-    lemmatizer = lemmatizer or WordNetLemmatizer()
     text_lower = text.lower()
     found_positions = set()
 
@@ -216,129 +194,88 @@ def get_species_mentions(
 
     def process_mention(start, end, match_text, species_name):
         sent_start_candidates = [pos for pos in sentence_mapping.keys() if pos <= start]
-        if not sent_start_candidates:
-            return False
+        if sent_start_candidates:
+            sent_start = max(sent_start_candidates)
+            sent_info = sentence_mapping[sent_start]
 
-        sent_start = max(sent_start_candidates)
-        sent_info = sentence_mapping[sent_start]
+            curr_idx = next((i for i, (_, sentence) in enumerate(indexed_sentences) if sentence == sent_info['text']), -1)
 
-        curr_idx = -1
-        for i, (_, sentence) in enumerate(indexed_sentences):
-            if sentence == sent_info['text']:
-                curr_idx = i
-                break
+            if curr_idx != -1:
+                is_multi_word = " " in match_text.lower()
+                special_case = species_name.lower() in ["raven", "tree"]
 
-        if curr_idx == -1:
-            return False
+                word_pos = None
+                if not (is_multi_word or special_case):
+                    first_word = match_text.split()[0]
+                    word_pos = next((pos_ for w, pos_ in sent_info['pos_tags'] if w.lower() == first_word.lower()), None)
 
-        is_multi_word = " " in match_text.lower()
-        special_case = species_name.lower() in ["raven", "tree"]
+                    if word_pos:
+                        if species_name.lower() == "marten" and word_pos in ("NNP", "NNPS"):
+                            return False
+                        if species_name.lower() in ["swift", "sage", "coral"] and word_pos.startswith("JJ"):
+                            return False
+                        if not (word_pos.startswith("NN") or word_pos.startswith("JJ")):
+                            return False
 
-        word_pos = None
-        if not (is_multi_word or special_case):
-            first_word = match_text.split()[0]
-            for w, pos_ in sent_info['pos_tags']:
-                if w.lower() == first_word.lower():
-                    word_pos = pos_
-                    break
+                if output_format == "analysis":
+                    mention_data = extract_mention_context(
+                        indexed_sentences, curr_idx, sent_info['text'],
+                        start - sent_start, (start - sent_start) + len(match_text),
+                        match_text, species_name
+                    )
+                    analysis_mentions[species_name].append(mention_data)
 
-            if not word_pos:
-                return False
+                elif output_format == "annotation":
+                    pos_value = "COMPOUND" if is_multi_word else (
+                        "nn" if special_case else word_pos
+                    )
 
-            if species_name.lower() == "marten" and word_pos in ("NNP", "NNPS"):
-                return False
-            if species_name.lower() in ["swift", "sage", "coral"] and word_pos.startswith("JJ"):
-                return False
+                    annotation_mentions.append({
+                        "from_name": "label",
+                        "to_name": "text",
+                        "type": "labels",
+                        "value": {
+                            "start": start,
+                            "end": end,
+                            "text": match_text,
+                            "sentence": sent_info['text'],
+                            "pos": pos_value,
+                            "labels": [species_name]
+                        }
+                    })
 
-            if not (word_pos.startswith("NN") or word_pos.startswith("JJ")):
-                return False
+                return True
+        return False
 
-        if output_format == "analysis":
-            mention_data = extract_mention_context(
-                indexed_sentences, curr_idx, sent_info['text'],
-                start - sent_start, (start - sent_start) + len(match_text),
-                match_text, species_name
-            )
-            analysis_mentions[species_name].append(mention_data)
-
-        elif output_format == "annotation":
-            pos_value = "COMPOUND" if is_multi_word else (
-                "nn" if special_case else word_pos
-            )
-
-            annotation_mentions.append({
-                "from_name": "label",
-                "to_name": "text",
-                "type": "labels",
-                "value": {
-                    "start": start,
-                    "end": end,
-                    "text": match_text,
-                    "sentence": sent_info['text'],
-                    "pos": pos_value,
-                    "labels": [species_name]
-                }
-            })
-
-        return True
-
-    if multi_word_terms:
-        multi_word_pattern = '|'.join(re.escape(term) for term in multi_word_terms)
-        for match in re.finditer(rf"\b({multi_word_pattern})\b", text_lower):
+    for term in multi_word_terms:
+        for match in re.finditer(rf"\b{re.escape(term)}\b", text_lower):
             start, end = match.span()
-            if not any((s <= start < e or s < end <= e) for s, e in found_positions):
-                matched_text = match.group(1)
-                species_original = lemma_to_original.get(matched_text, matched_text)
-
+            if not any(s <= start < e or s < end <= e for s, e in found_positions):
+                species_original = original_to_lower.get(match_text, match_text)
                 if process_mention(start, end, text[start:end], species_original):
                     found_positions.add((start, end))
-
-    compound_pattern = '|'.join(
-        f"{lemma}\\s+(?:tree|fish|flower|rose|marten|bird|slug|snail|etc)s?"
-        for lemma in lemma_to_original.keys()
-        if " " not in lemma
-    )
-
-    if compound_pattern:
-        for match in re.finditer(rf"\b({compound_pattern})\b", text_lower):
-            start, end = match.span()
-            if not any((s <= start < e or s < end <= e) for s, e in found_positions):
-                matched_str = match.group(1)
-                first_tok = matched_str.split()[0]
-                lemma = lemmatizer.lemmatize(first_tok.lower(), pos='n')
-
-                if lemma in lemma_to_original:
-                    species_original = lemma_to_original[lemma]
-
-                    if process_mention(start, end, text[start:end], species_original):
-                        found_positions.add((start, end))
 
     offset_in_text = 0
     tokens = word_tokenize(text)
     tagged_tokens = pos_tag(tokens)
 
-    for i, (tok, pos_) in enumerate(tagged_tokens):
+    for tok, pos_ in tagged_tokens:
         tok_lower = tok.lower()
-
         found_idx = text_lower.find(tok_lower, offset_in_text)
 
-        if found_idx == -1:
-            continue
+        if found_idx != -1:
+            start = found_idx
+            end = found_idx + len(tok)
+            offset_in_text = end
 
-        start = found_idx
-        end = found_idx + len(tok)
-        offset_in_text = end
+            original_name = original_to_lower.get(tok_lower)
 
-        lemma = lemmatizer.lemmatize(tok_lower, pos='n')
-
-        if lemma in lemma_to_original:
-            original_name = lemma_to_original[lemma]
-
-            if not any((s <= start < e_ or s < end <= e_) for s, e_ in found_positions):
+            if original_name and not any((s <= start < e_ or s < end <= e_) for s, e_ in found_positions):
                 if process_mention(start, end, text[start:end], original_name):
                     found_positions.add((start, end))
 
     return analysis_mentions if output_format == "analysis" else annotation_mentions
+
 
 
 def batch_process(items, batch_size, process_func, *args, **kwargs):
