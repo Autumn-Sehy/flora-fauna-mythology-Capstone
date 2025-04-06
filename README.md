@@ -6,3 +6,6 @@ Note that this capstone is in progress -- I'm hoping to add more detail on this 
 At the moment I'm hardcoding the plurals of my flora/fauna, as I find there aren't many flora/fauna words in stories in English and regex+hardcode is honestly faster and more effective than NER for this task (though I may train NER on it in the future). I was lemmatizing earlier,  which was a pain, so I'm just adding the plural of each flora/fauna to my CSV files.
 I also cleaned logic and code in the utils file --> but this will be much cleaner once lemmatization is removed.
 Lemmatizaion of stories is also slooooooow, so having a list of plurals will significantly speed up the program.
+
+*Updates as of 4/6*
+I've updated batch processing of the files and have included semantic role labeling - the old school way with allennlp! Then I looked up correlated verbs with flora/fauna in context. I'm also hosting a website that will allow this data to be visualized and explored because there is a LOT.
